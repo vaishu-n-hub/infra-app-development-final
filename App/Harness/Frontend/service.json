@@ -1,0 +1,33 @@
+{
+  "desiredCount": "<+serviceVariables.DesiredCount>",
+  "launchType": "FARGATE",
+  "serviceName": "<+serviceVariables.containername>",
+  "deploymentConfiguration": {
+  "maximumPercent": 200,
+  "minimumHealthyPercent": 100,
+  "deploymentCircuitBreaker": {
+    "enable": true,
+    "rollback": true
+  }
+},
+  "networkConfiguration": {
+    "awsvpcConfiguration": {
+      "subnets": [
+        "<+serviceVariables.SubnetA>",
+        "<+serviceVariables.SubnetB>",
+        "<+serviceVariables.SubnetC>"
+      ],
+      "securityGroups": [
+        "<+serviceVariables.SecurityGroup>", 
+      ],
+      "assignPublicIp": "ENABLED"
+    }
+  },
+  "loadBalancers": [
+    {
+      "targetGroupArn": "<+serviceVariables.targetGroupArn>",
+      "containerName": "<+serviceVariables.containername>",
+      "containerPort": "<+serviceVariables.containerport>"
+    }
+  ]
+}

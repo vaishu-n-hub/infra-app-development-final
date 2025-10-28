@@ -1,0 +1,26 @@
+{
+  "family": "hpm-<+serviceVariables.containername>-td",
+  "executionRoleArn": "<+serviceVariables.executionRoleArn>",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "memory": "<+serviceVariables.memory>",
+  "cpu": "<+serviceVariables.cpu>",
+  "containerDefinitions": [
+    {
+      "name": "<+serviceVariables.containername>",
+      "image": "<+artifact.image>",
+      "portMappings": [
+        {"containerPort": "<+serviceVariables.containerport>"}
+      ],
+      "logConfiguration": {
+          "logDriver": "awslogs",
+          "options": {
+              "awslogs-create-group": "true",
+              "awslogs-group": "/ecs/<+serviceVariables.containername>",
+              "awslogs-region": "<+serviceVariables.region>",
+              "awslogs-stream-prefix": "<+serviceVariables.containername>"
+          }
+      },      
+    }
+  ]
+}
