@@ -50,6 +50,19 @@ output "ecr_repo_arns" {
 }
 
 
+// ECS IAM Outputs
+
+output "ecs_task_execution_role_arn" {
+  description = "ARN of the ECS task execution role"
+  value       = module.tf-iam.ecs_task_exec_role_arn
+}
+
+output "ecs_node_instance_profile_name" {
+  description = "Instance profile name for ECS EC2 nodes"
+  value       = module.tf-iam.ecs_node_profile_name
+}
+
+
 // EKS Outputs 
 
 output "eks_control_plane_sg_id" {

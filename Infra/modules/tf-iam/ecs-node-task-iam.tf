@@ -51,3 +51,8 @@ resource "aws_iam_role" "ecs_task_exec_role" {
 output "ecs_node_profile_name" {
   value = aws_iam_instance_profile.ecs_node.name
 }
+
+output "ecs_task_exec_role_arn" {
+  description = "ARN of the ECS task execution role"
+  value       = aws_iam_role.ecs_task_exec_role.arn
+}

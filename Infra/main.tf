@@ -56,6 +56,10 @@ module "tf-alb" {
 }
 
 
+module "tf-iam" {
+  source = "./modules/tf-iam"
+}
+
 module "tf-ecr" {
   source           = "./modules/tf-ecr"
   repository_names = var.ecr_repository_names

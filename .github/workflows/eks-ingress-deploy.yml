@@ -1,0 +1,454 @@
+name: EKS Ingress and ALB Controller Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'deploy-ingress'
+        type: choice
+        options:
+          - deploy-alb-controller
+          - deploy-ingress
+          - deploy-all
+          - destroy-ingress
+          - destroy-alb-controller
+          - destroy-all
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EKS_CLUSTER_NAME: ${{ secrets.EKS_CLUSTER_NAME }}
+  HELM_VERSION: '3.13.0'
+
+jobs:
+  deploy-alb-controller:
+    name: Deploy AWS Load Balancer Controller
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      (github.event.inputs.action == 'deploy-alb-controller' || github.event.inputs.action == 'deploy-all')
+    environment: 
+      name: production
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-ALBController
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.29.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Verify EKS Connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create OIDC Provider (if not exists)
+        run: |
+          # Get OIDC issuer URL
+          OIDC_URL=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} --query "cluster.identity.oidc.issuer" --output text)
+          OIDC_ID=$(echo $OIDC_URL | cut -d '/' -f 5)
+          
+          # Check if OIDC provider exists
+          if aws iam list-open-id-connect-providers | grep -q $OIDC_ID; then
+            echo "OIDC provider already exists"
+          else
+            echo "Creating OIDC provider..."
+            eksctl utils associate-iam-oidc-provider \
+              --cluster ${{ env.EKS_CLUSTER_NAME }} \
+              --region ${{ env.AWS_REGION }} \
+              --approve
+          fi
+
+      - name: Download ALB Controller IAM Policy
+        run: |
+          curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.13.3/docs/install/iam_policy.json
+
+      - name: Create IAM Policy for ALB Controller
+        run: |
+          POLICY_NAME="AWSLoadBalancerControllerIAMPolicy-${{ env.EKS_CLUSTER_NAME }}"
+          
+          # Check if policy exists
+          POLICY_ARN=$(aws iam list-policies --query "Policies[?PolicyName=='${POLICY_NAME}'].Arn" --output text)
+          
+          if [ -z "$POLICY_ARN" ]; then
+            echo "Creating IAM policy..."
+            aws iam create-policy \
+              --policy-name $POLICY_NAME \
+              --policy-document file://iam-policy.json
+          else
+            echo "Policy already exists: $POLICY_ARN"
+          fi
+
+      - name: Create IAM Role for Service Account (IRSA)
+        run: |
+          POLICY_NAME="AWSLoadBalancerControllerIAMPolicy-${{ env.EKS_CLUSTER_NAME }}"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
+          
+          # Create service account with IAM role
+          eksctl create iamserviceaccount \
+            --cluster=${{ env.EKS_CLUSTER_NAME }} \
+            --namespace=kube-system \
+            --name=aws-load-balancer-controller \
+            --attach-policy-arn=$POLICY_ARN \
+            --override-existing-serviceaccounts \
+            --region ${{ env.AWS_REGION }} \
+            --approve
+
+      - name: Add EKS Helm Repository
+        run: |
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+
+      - name: Install AWS Load Balancer Controller
+        run: |
+          VPC_ID=$(aws eks describe-cluster --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }} --query "cluster.resourcesVpcConfig.vpcId" --output text)
+          
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --set clusterName=${{ env.EKS_CLUSTER_NAME }} \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set region=${{ env.AWS_REGION }} \
+            --set vpcId=$VPC_ID \
+            --wait
+
+      - name: Verify ALB Controller Deployment
+        run: |
+          kubectl get deployment -n kube-system aws-load-balancer-controller
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+
+  deploy-ingress:
+    name: Deploy Ingress Resource
+    runs-on: ubuntu-latest
+    needs: [deploy-alb-controller]
+    if: |
+      always() &&
+      (needs.deploy-alb-controller.result == 'success' || needs.deploy-alb-controller.result == 'skipped') &&
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    environment: 
+      name: production
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-IngressDeploy
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.29.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Get Terraform Outputs for Ingress Configuration
+        run: |
+          # Get app-tier subnet IDs from Terraform state or AWS
+          SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=tag:Name,Values=app-tier-subnet-*" \
+            --query "Subnets[*].SubnetId" \
+            --output text)
+          
+          SUBNET_ARRAY=($SUBNETS)
+          echo "SUBNET_A=${SUBNET_ARRAY[0]}" >> $GITHUB_ENV
+          echo "SUBNET_B=${SUBNET_ARRAY[1]}" >> $GITHUB_ENV
+          echo "SUBNET_C=${SUBNET_ARRAY[2]}" >> $GITHUB_ENV
+          
+          # Get backend ALB security group
+          BACKEND_ALB_SG=$(aws ec2 describe-security-groups \
+            --filters "Name=tag:Name,Values=backend-alb-sg" \
+            --query "SecurityGroups[0].GroupId" \
+            --output text)
+          echo "BACKEND_ALB_SG=${BACKEND_ALB_SG}" >> $GITHUB_ENV
+
+      - name: Create Ingress Values File
+        run: |
+          cat > App/Harness/Backend/ingress/values-override.yaml <<EOF
+          ingress:
+            certificateArn: "${{ secrets.ACM_CERTIFICATE_ARN }}"
+            securitygroup: "${{ env.BACKEND_ALB_SG }}"
+            subnets:
+              subnetA: "${{ env.SUBNET_A }}"
+              subnetB: "${{ env.SUBNET_B }}"
+              subnetC: "${{ env.SUBNET_C }}"
+
+          routes:
+            - path: /customer*
+              serviceName: customer-service
+              servicePort: 8080
+              
+            - path: /driver*
+              serviceName: driver-service
+              servicePort: 8080
+          EOF
+
+      - name: Validate Helm Chart
+        run: |
+          helm lint App/Harness/Backend/ingress \
+            -f App/Harness/Backend/ingress/values-override.yaml
+
+      - name: Deploy Ingress with Helm
+        run: |
+          helm upgrade --install backend-ingress \
+            App/Harness/Backend/ingress \
+            -f App/Harness/Backend/ingress/values-override.yaml \
+            --namespace default \
+            --create-namespace \
+            --wait \
+            --timeout 5m
+
+      - name: Verify Ingress Deployment
+        run: |
+          kubectl get ingress -n default
+          kubectl describe ingress ingress-hpm -n default
+
+      - name: Get ALB DNS Name
+        run: |
+          echo "Waiting for ALB to be provisioned..."
+          sleep 30
+          
+          ALB_DNS=$(kubectl get ingress ingress-hpm -n default -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          
+          if [ -z "$ALB_DNS" ]; then
+            echo "⚠️ ALB not yet provisioned. Check ingress status:"
+            kubectl describe ingress ingress-hpm -n default
+          else
+            echo "✅ Backend ALB DNS: $ALB_DNS"
+            echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          fi
+
+      - name: Cleanup Temporary Files
+        if: always()
+        run: rm -f App/Harness/Backend/ingress/values-override.yaml
+
+  validate-ingress:
+    name: Validate Ingress (PR Only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Lint Helm Chart
+        run: |
+          helm lint App/Harness/Backend/ingress
+
+      - name: Validate Ingress Template
+        run: |
+          helm template backend-ingress App/Harness/Backend/ingress \
+            --set ingress.certificateArn=arn:aws:acm:us-east-1:123456789012:certificate/test \
+            --set ingress.securitygroup=sg-test \
+            --set ingress.subnets.subnetA=subnet-test1 \
+            --set ingress.subnets.subnetB=subnet-test2 \
+            --set ingress.subnets.subnetC=subnet-test3
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '✅ **Ingress Helm Chart Validation Passed**\n\nThe ingress configuration is valid and ready for deployment.'
+            })
+
+  destroy-ingress:
+    name: Destroy Ingress Resource
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      (github.event.inputs.action == 'destroy-ingress' || github.event.inputs.action == 'destroy-all')
+    environment: 
+      name: production-destroy
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-IngressDestroy
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.29.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Uninstall Ingress
+        run: |
+          helm uninstall backend-ingress --namespace default || echo "Ingress not found"
+
+      - name: Verify Deletion
+        run: |
+          kubectl get ingress -n default
+
+  destroy-alb-controller:
+    name: Destroy AWS Load Balancer Controller
+    runs-on: ubuntu-latest
+    needs: [destroy-ingress]
+    if: |
+      always() &&
+      github.event_name == 'workflow_dispatch' && 
+      (github.event.inputs.action == 'destroy-alb-controller' || github.event.inputs.action == 'destroy-all')
+    environment: 
+      name: production-destroy
+    
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-ALBControllerDestroy
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.29.0'
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Check for Remaining Ingresses
+        run: |
+          INGRESS_COUNT=$(kubectl get ingress -A --no-headers 2>/dev/null | wc -l)
+          if [ "$INGRESS_COUNT" -gt 0 ]; then
+            echo "⚠️ Warning: Found $INGRESS_COUNT ingress resource(s) still running"
+            echo "Listing all ingresses:"
+            kubectl get ingress -A
+            echo ""
+            echo "⚠️ These ingresses should be deleted first to avoid orphaned ALBs"
+            echo "Continuing anyway as this is a destroy operation..."
+          else
+            echo "✅ No ingress resources found. Safe to remove controller."
+          fi
+
+      - name: Uninstall ALB Controller Helm Release
+        run: |
+          helm uninstall aws-load-balancer-controller --namespace kube-system || echo "Helm release not found"
+
+      - name: Delete Service Account
+        run: |
+          kubectl delete serviceaccount aws-load-balancer-controller -n kube-system || echo "Service account not found"
+
+      - name: Delete IAM Service Account (IRSA)
+        run: |
+          eksctl delete iamserviceaccount \
+            --cluster=${{ env.EKS_CLUSTER_NAME }} \
+            --namespace=kube-system \
+            --name=aws-load-balancer-controller \
+            --region ${{ env.AWS_REGION }} || echo "IAM service account not found"
+
+      - name: Delete IAM Policy
+        run: |
+          POLICY_NAME="AWSLoadBalancerControllerIAMPolicy-${{ env.EKS_CLUSTER_NAME }}"
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
+          
+          # Check if policy exists
+          if aws iam get-policy --policy-arn $POLICY_ARN 2>/dev/null; then
+            echo "Deleting IAM policy: $POLICY_ARN"
+            aws iam delete-policy --policy-arn $POLICY_ARN
+          else
+            echo "IAM policy not found: $POLICY_ARN"
+          fi
+
+      - name: Verify Controller Removal
+        run: |
+          echo "Checking for controller pods..."
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller || echo "✅ No controller pods found"
+          
+          echo ""
+          echo "Checking for controller deployment..."
+          kubectl get deployment -n kube-system aws-load-balancer-controller || echo "✅ No controller deployment found"
+          
+          echo ""
+          echo "✅ ALB Controller successfully removed!"
+          echo ""
+          echo "⚠️ Note: OIDC provider is NOT deleted (shared resource)"
+          echo "If you want to delete it manually:"
+          echo "  aws iam delete-open-id-connect-provider --open-id-connect-provider-arn <oidc-provider-arn>"
