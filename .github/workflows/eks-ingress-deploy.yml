@@ -209,7 +209,7 @@ jobs:
         run: |
           cat > App/Harness/Backend/ingress/values-override.yaml <<EOF
           ingress:
-            certificateArn: "${{ secrets.ACM_CERTIFICATE_ARN }}"
+            certificateArn: "${{ secrets.ACM_CERTIFICATE_ARN_PRIVATE }}"
             securitygroup: "${{ env.BACKEND_ALB_SG }}"
             subnets:
               subnetA: "${{ env.SUBNET_A }}"
