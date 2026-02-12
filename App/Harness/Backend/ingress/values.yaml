@@ -13,11 +13,8 @@ ingress:
 
 routes:
   - path: /customer*
-    serviceName: customer-service
+    serviceName: packersmovers-app-service
     servicePort: 8080
     
-  - path: /driver*
-    serviceName: driver-service
-    servicePort: 8080
 
 

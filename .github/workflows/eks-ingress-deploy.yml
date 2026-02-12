@@ -227,11 +227,7 @@ jobs:
 
           routes:
             - path: /customer*
-              serviceName: customer-service
-              servicePort: 8080
-              
-            - path: /driver*
-              serviceName: driver-service
+              serviceName: packersandmovers-app-service
               servicePort: 8080
           EOF
 
