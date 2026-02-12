@@ -157,13 +157,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [deploy-alb-controller]
     if: |
-      always() &&
-      (needs.deploy-alb-controller.result == 'success' || needs.deploy-alb-controller.result == 'skipped') &&
-      (
-        github.ref == 'refs/heads/main' || 
-        (github.event_name == 'workflow_dispatch' && 
-         (github.event.inputs.action == 'deploy-ingress' || github.event.inputs.action == 'deploy-all'))
-      )
+      github.event_name == 'workflow_dispatch' && 
+      (github.event.inputs.action == 'deploy-ingress' || github.event.inputs.action == 'deploy-all') &&
+      (needs.deploy-alb-controller.result == 'success' || needs.deploy-alb-controller.result == 'skipped')
     environment: 
       name: production
     
